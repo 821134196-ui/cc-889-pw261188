@@ -1,0 +1,17 @@
+{
+  "name": "sharded-kv-live-migration",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "精简分片键值存储 + 键范围在线搬迁（全量复制、增量追平、断连重试、旧路由归属确认）与可视化演练台",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "test": "node test/smoke.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}

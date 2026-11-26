@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>分片 KV · 在线搬迁演练台</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%234f46e5'/><text x='50' y='68' font-size='52' text-anchor='middle' fill='white' font-family='monospace' font-weight='bold'>K</text></svg>" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar-inner">
+        <div class="brand">
+          <div class="logo" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><path d="M17.5 14v7M14 17.5h7"/></svg>
+          </div>
+          <div>
+            <h1>分片 KV · 在线搬迁演练台</h1>
+            <p class="subtitle">先全量复制 → 再追增量 ｜ 代理 / 搬迁进程断连可重试 ｜ 旧路由缓存下确认新写入归属</p>
+          </div>
+        </div>
+        <div class="topbadges">
+          <span class="chip chip-epoch" data-testid="epoch-badge" title="全局拓扑版本">拓扑 epoch <b id="epoch-value">–</b></span>
+          <span class="chip chip-truth" data-testid="truth-badge" title="已确认写入的逻辑键数">真值键 <b id="truth-value">–</b></span>
+          <button class="btn btn-ghost-danger" id="btn-reset" data-testid="btn-reset" type="button">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>
+            重置演示
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <main class="container">
+      <!-- ============ 搬迁总控 ============ -->
+      <section class="card migration-card" data-testid="migration-card">
+        <div class="migration-head">
+          <div class="migration-title">
+            <h2>键范围在线搬迁</h2>
+            <span class="phase-badge phase-idle" id="migration-phase" data-testid="migration-phase">加载中…</span>
+            <span class="link-badge" id="mig-source-link" data-testid="mig-source-link">源链路 –</span>
+          </div>
+          <div class="migration-actions">
+            <button class="btn btn-primary" id="btn-pause" data-testid="btn-pause" type="button" disabled>
+              <span class="ico-pause">⏸</span><span class="btn-label">暂停搬迁</span>
+            </button>
+            <button class="btn btn-success" id="btn-cutover" data-testid="btn-cutover" type="button" disabled>完成切换</button>
+            <button class="btn btn-warn" id="btn-gc" data-testid="btn-gc" type="button" disabled>清理源旧副本</button>
+            <button class="btn" id="btn-start" data-testid="btn-start" type="button" hidden>启动搬迁</button>
+          </div>
+        </div>
+
+        <div class="stepper" id="stepper" data-testid="stepper">
+          <div class="step" data-step="snapshot"><span class="step-dot">1</span><span class="step-label">全量复制</span></div>
+          <div class="step-line"></div>
+          <div class="step" data-step="streaming"><span class="step-dot">2</span><span class="step-label">追增量</span></div>
+          <div class="step-line"></div>
+          <div class="step" data-step="committing"><span class="step-dot">3</span><span class="step-label">栅栏 + 提交</span></div>
+          <div class="step-line"></div>
+          <div class="step" data-step="committed"><span class="step-dot">4</span><span class="step-label">切换完成</span></div>
+        </div>
+
+        <div class="progress-wrap">
+          <div class="progress-meta">
+            <span id="mig-range-text" data-testid="mig-range-text">范围 –</span>
+            <span id="mig-progress-text" data-testid="mig-progress-text">0 / 0</span>
+          </div>
+          <div class="progress" data-testid="mig-progress-bar"><div class="progress-bar" id="mig-progress-bar-inner" style="width:0%"></div></div>
+        </div>
+
+        <div class="mig-stats">
+          <div class="stat"><span class="stat-label">全量行</span><span class="stat-value" id="stat-rows">0</span></div>
+          <div class="stat"><span class="stat-label">增量 op 回放</span><span class="stat-value" id="stat-ops">0</span></div>
+          <div class="stat"><span class="stat-label">oplog 延迟</span><span class="stat-value" id="stat-lag">0</span></div>
+          <div class="stat"><span class="stat-label">重试次数</span><span class="stat-value" id="stat-retries">0</span></div>
+          <div class="stat"><span class="stat-label">断连次数</span><span class="stat-value" id="stat-episodes">0</span></div>
+          <div class="stat"><span class="stat-label">fence / epoch</span><span class="stat-value" id="stat-fence">–</span></div>
+        </div>
+        <p class="hint" id="mig-hint">提示：搬迁进入“追增量”后会持续运行，可随时暂停并在左侧实写键值。</p>
+      </section>
+
+      <div class="grid-panels">
+        <!-- ============ KV 实写 / 实读 / 核对 ============ -->
+        <section class="card kv-card">
+          <div class="card-head"><h2>① 实写键值 / 读取核对</h2><span class="card-tag">经代理写入</span></div>
+
+          <div class="quick-keys" data-testid="quick-keys">
+            <span class="quick-label">搬迁范围内快键：</span>
+          </div>
+
+          <div class="field">
+            <label for="input-key">键 Key</label>
+            <input id="input-key" data-testid="input-key" type="text" value="key:0501" placeholder="例如 key:0501" autocomplete="off" spellcheck="false" />
+          </div>
+          <div class="field">
+            <label for="input-value">值 Value</label>
+            <input id="input-value" data-testid="input-value" type="text" placeholder="输入要实写的值，例如 hello-migration" autocomplete="off" />
+          </div>
+          <div class="btn-row">
+            <button class="btn btn-primary" id="btn-write" data-testid="btn-write" type="button">
+              <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+              写入键值
+            </button>
+            <button class="btn" id="btn-read" data-testid="btn-read" type="button">读取</button>
+            <button class="btn btn-outline-success" id="btn-verify" data-testid="btn-verify" type="button">核对分片</button>
+            <button class="btn btn-ghost-danger" id="btn-delete" data-testid="btn-delete" type="button">删除</button>
+          </div>
+
+          <div class="result-block" data-testid="write-result" id="write-result" aria-live="polite">
+            <div class="result-placeholder">写入结果将显示在这里（含路由尝试轨迹）。</div>
+          </div>
+          <div class="result-block read-block" data-testid="read-result" id="read-result" aria-live="polite">
+            <div class="result-placeholder">读结果将显示在这里。</div>
+          </div>
+          <div class="result-block verify-block" data-testid="verify-result" id="verify-result" aria-live="polite">
+            <div class="result-placeholder">点击“核对分片”：比较代理读结果、权威属主物理数据与各分片副本。</div>
+          </div>
+        </section>
+
+        <!-- ============ 归属确认 + 代理缓存 ============ -->
+        <section class="card route-card">
+          <div class="card-head"><h2>② 归属确认与代理缓存</h2><span class="card-tag tag-indigo">旧路由自愈</span></div>
+
+          <div class="field-row">
+            <div class="field grow">
+              <label for="ownership-key">待确认归属的键</label>
+              <input id="ownership-key" data-testid="ownership-key" type="text" value="key:0501" spellcheck="false" autocomplete="off" />
+            </div>
+            <button class="btn" id="btn-ownership" data-testid="btn-ownership" type="button">权威查询</button>
+            <button class="btn btn-primary" id="btn-proxy-confirm" data-testid="btn-proxy-confirm" type="button">代理确认并刷新</button>
+          </div>
+          <div class="result-block ownership-block" data-testid="ownership-result" id="ownership-result">
+            <div class="result-placeholder">GET /api/ownership 返回权威属主、范围 epoch 与 fence 令牌。</div>
+          </div>
+
+          <div class="cache-head">
+            <h3>代理路由缓存</h3>
+            <div class="mini-actions">
+              <button class="btn btn-mini btn-danger-outline" id="btn-inject-stale" data-testid="btn-inject-stale" type="button">注入旧路由</button>
+              <button class="btn btn-mini" id="btn-clear-cache" data-testid="btn-clear-cache" type="button">清空缓存</button>
+              <label class="mini-switch" title="开启后代理每秒与配置中心对齐，将无法复现旧缓存场景">
+                <input type="checkbox" id="auto-refresh-cache" data-testid="auto-refresh-cache" />
+                <span>自动刷新</span>
+              </label>
+            </div>
+          </div>
+          <div class="table-wrap cache-table-wrap">
+            <table class="table" data-testid="cache-table">
+              <thead><tr><th>范围</th><th>缓存路由</th><th>权威路由</th><th>状态</th><th>来源</th></tr></thead>
+              <tbody id="cache-tbody"><tr><td colspan="5" class="muted center">加载中…</td></tr></tbody>
+            </table>
+          </div>
+
+          <h3 class="trace-title">最近一次路由确认轨迹</h3>
+          <div class="trace-log" id="trace-log" data-testid="trace-log">
+            <div class="muted tiny">写入 / 读取 / 手动确认后，这里展示完整的尝试与确认轨迹。</div>
+          </div>
+        </section>
+
+        <!-- ============ 故障注入 / 流量 / 巡检 ============ -->
+        <section class="card fault-card">
+          <div class="card-head"><h2>③ 故障注入与一致性</h2><span class="card-tag tag-danger">演练</span></div>
+
+          <div class="switch-list">
+            <label class="switch-row" data-testid="fault-row-proxy-migrator">
+              <span class="switch"><input type="checkbox" id="fault-proxy-migrator" data-testid="fault-proxy-migrator" /><span class="slider"></span></span>
+              <span class="switch-text">
+                <b>代理 ↔ 搬迁进程 失去连接</b>
+                <small>归属确认优先询问搬迁进程；断开时重试并回退拓扑主管</small>
+              </span>
+              <span class="link-state" id="state-proxy-migrator">–</span>
+            </label>
+            <div class="blip-row">
+              <button class="btn btn-mini" data-blip="proxy->migrator" type="button">注入 2.5 秒瞬断</button>
+            </div>
+
+            <label class="switch-row" data-testid="fault-row-migrator-source">
+              <span class="switch"><input type="checkbox" id="fault-migrator-source" data-testid="fault-migrator-source" /><span class="slider"></span></span>
+              <span class="switch-text">
+                <b>搬迁进程 ↔ 源分片 失去连接</b>
+                <small>保留扫描 lastKey 与 oplog seq，恢复后断点续传，不重复不丢失</small>
+              </span>
+              <span class="link-state" id="state-migrator-source">–</span>
+            </label>
+            <div class="blip-row">
+              <button class="btn btn-mini" data-blip="migrator->source" type="button">注入 2.5 秒瞬断</button>
+            </div>
+          </div>
+
+          <div class="traffic-box">
+            <label class="switch-row compact">
+              <span class="switch"><input type="checkbox" id="traffic-toggle" data-testid="traffic-toggle" /><span class="slider"></span></span>
+              <span class="switch-text"><b>开启持续写入流量</b><small>每 0.85s 向搬迁范围内轮转实写</small></span>
+            </label>
+            <div class="traffic-stats" id="traffic-stats" data-testid="traffic-stats">未开启</div>
+          </div>
+
+          <div class="audit-box">
+            <button class="btn btn-outline-success block" id="btn-audit" data-testid="btn-audit" type="button">全量一致性巡检（真值 vs 权威属主物理数据）</button>
+            <div class="result-block audit-result" id="audit-result" data-testid="audit-result">
+              <div class="result-placeholder">尚未巡检。</div>
+            </div>
+          </div>
+
+          <div class="guide-box">
+            <h3>推荐演练路径</h3>
+            <ol>
+              <li>等“全量复制”完成，进入 <b>追增量</b>。</li>
+              <li>点 <b>暂停搬迁</b>，在左侧实写 <code>key:0501</code>，点 <b>核对分片</b>：读写一致，目标分片暂时落后。</li>
+              <li>恢复搬迁，打开 <b>代理↔搬迁进程断连</b>，点 <b>完成切换</b>。</li>
+              <li>切换后直接写入 <code>key:0666</code>：旧缓存被拒 → 经配置中心确认新归属 → 重试成功。</li>
+              <li>查看分片状态、读结果与事件流，最后跑一次全量巡检。</li>
+            </ol>
+          </div>
+        </section>
+      </div>
+
+      <!-- ============ 分片状态 ============ -->
+      <h2 class="section-title">分片物理状态 <span class="section-title-sub" data-testid="shard-hint">下表实时显示各分片在搬迁范围内的物理键值</span></h2>
+      <div class="shard-grid" data-testid="shard-grid">
+        <section class="card shard-card shard-1" data-testid="shard-shard-1" data-shard="shard-1">
+          <div class="shard-head">
+            <div><h3>shard-1 <span class="shard-cn">北京分片</span></h3><div class="ownership-chips" id="owner-shard-1"></div></div>
+            <span class="shard-dot"></span>
+          </div>
+          <div class="shard-metrics" id="metrics-shard-1"></div>
+          <div class="table-wrap shard-entries-wrap">
+            <table class="table dense">
+              <thead><tr><th>Key</th><th>Value</th><th>标记</th></tr></thead>
+              <tbody id="entries-shard-1" data-testid="shard-entries-shard-1"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="card shard-card shard-2" data-testid="shard-shard-2" data-shard="shard-2">
+          <div class="shard-head">
+            <div><h3>shard-2 <span class="shard-cn">上海分片 · 搬迁源</span></h3><div class="ownership-chips" id="owner-shard-2"></div></div>
+            <span class="shard-dot"></span>
+          </div>
+          <div class="shard-metrics" id="metrics-shard-2"></div>
+          <div class="table-wrap shard-entries-wrap">
+            <table class="table dense">
+              <thead><tr><th>Key</th><th>Value</th><th>标记</th></tr></thead>
+              <tbody id="entries-shard-2" data-testid="shard-entries-shard-2"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="card shard-card shard-3" data-testid="shard-shard-3" data-shard="shard-3">
+          <div class="shard-head">
+            <div><h3>shard-3 <span class="shard-cn">广州分片 · 搬迁目标</span></h3><div class="ownership-chips" id="owner-shard-3"></div></div>
+            <span class="shard-dot"></span>
+          </div>
+          <div class="shard-metrics" id="metrics-shard-3"></div>
+          <div class="table-wrap shard-entries-wrap">
+            <table class="table dense">
+              <thead><tr><th>Key</th><th>Value</th><th>标记</th></tr></thead>
+              <tbody id="entries-shard-3" data-testid="shard-entries-shard-3"></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+
+      <!-- ============ 事件流 ============ -->
+      <section class="card log-card">
+        <div class="card-head">
+          <h2>事件流 / 审计日志</h2>
+          <div class="log-actions">
+            <label class="mini-switch"><input type="checkbox" id="log-autoscroll" checked /><span>自动滚动</span></label>
+            <button class="btn btn-mini" id="btn-clear-view" type="button">清屏</button>
+          </div>
+        </div>
+        <div class="event-log" id="event-log" data-testid="event-log" aria-live="off"></div>
+      </section>
+
+      <footer class="footer">
+        <span>零依赖 Node 实现 · 数据为内存态，重置即恢复播种</span>
+        <span>API：<code>POST /api/kv</code> · <code>GET /api/kv/:key</code> · <code>GET /api/verify?key=</code> · <code>/api/migration/*</code> · <code>/api/faults</code> · <code>GET /api/state</code></span>
+      </footer>
+    </main>
+
+    <div class="toast-stack" id="toast-stack" data-testid="toast-stack"></div>
+    <script src="/app.js" defer></script>
+  </body>
+</html>
